@@ -27,6 +27,8 @@ struct ProfileData {
   uint32_t prefetch_cancellations;
   uint32_t prefetch_wasted_bytes;
   uint32_t prefetch_wait_time_acc;
+  uint32_t demand_requests;
+  uint32_t demand_wait_time_acc;
   uint32_t loop_time_acc;
   uint32_t frames;
   uint32_t min_free_heap;
@@ -48,6 +50,8 @@ static void reset_prof() {
   prof.prefetch_cancellations = 0;
   prof.prefetch_wasted_bytes = 0;
   prof.prefetch_wait_time_acc = 0;
+  prof.demand_requests = 0;
+  prof.demand_wait_time_acc = 0;
   prof.loop_time_acc = 0;
   prof.frames = 0;
   prof.min_free_heap = ESP.getFreeHeap();
@@ -62,8 +66,8 @@ static void reset_prof() {
 //   HSPI (SPI2) — drives the SD card
 //
 // They have completely separate buses, DMA channels, and GPIO pins.
-// Core 0 can read from SD (HSPI) at the exact same moment that
-// Core 1 pushes pixels to the TFT (VSPI). True parallel I/O.
+// TFT is updated via VSPI while emulator state is held.
+// Core 1 manages all SD interactions via HSPI simultaneously. I/O.
 //
 // ┌─────────────────────────────────────────────────────────┐
 // │                     REWIRING GUIDE                      │
@@ -154,34 +158,22 @@ static std::atomic<uint32_t> pf_request_gen(0);
 static std::atomic<int> pf_request_bank(-1);
 static std::atomic<int> pf_active_slot(-1);
 
+// [PHASE 5.5] Demand State
+enum DemandState { DEMAND_FREE = 0, DEMAND_REQUESTED = 1, DEMAND_LOADING = 2, DEMAND_READY = 3, DEMAND_ERROR = 4 };
+static std::atomic<DemandState> dem_state(DEMAND_FREE);
+static std::atomic<uint32_t> dem_gen(0);
+static std::atomic<int> dem_bank(-1);
+static std::atomic<int> dem_slot(-1);
+
+// [PHASE 5.5] Save State
+enum SaveState { SAVE_FREE = 0, SAVE_REQUESTED = 1, SAVE_WRITING = 2, SAVE_DONE = 3, SAVE_ERROR = 4 };
+static std::atomic<SaveState> save_state(SAVE_FREE);
+
 static File     rom_file;
 static uint32_t rom_total_size;
 static uint32_t frame_count = 0;
+static TaskHandle_t sdTaskHandle = NULL;
 
-// SD reads go through HSPI. Core 1 uses VSPI for TFT.
-// No mutex needed — they are physically separate buses!
-static void cache_load_bank(int slot, int bank) {
-  int old_bank = bank_cache[slot].bank_num;
-  if (old_bank >= 0 && old_bank < MAX_BANKS)
-    bank_to_slot[old_bank] = -1;
-
-  uint32_t offset = (uint32_t)bank * BANK_SIZE;
-  size_t to_read = BANK_SIZE;
-  if (offset + to_read > rom_total_size) {
-    to_read = rom_total_size - offset;
-    memset(bank_cache[slot].data + to_read, 0xFF, BANK_SIZE - to_read);
-  }
-
-  uint32_t t0 = micros();
-  rom_file.seek(offset);
-  rom_file.read(bank_cache[slot].data, to_read);
-  prof.sd_time_acc += (micros() - t0);
-
-  bank_cache[slot].bank_num = bank;
-  if (bank < MAX_BANKS) bank_to_slot[bank] = slot;
-}
-
-// [PHASE 4] ROM Access Hot-Path: Minimal branches, manually inlined.
 static inline uint8_t* __attribute__((always_inline))
 resolve_bank_l2(int bank) {
   if (bank < MAX_BANKS) {
@@ -201,11 +193,11 @@ static uint8_t* cache_miss(int bank) {
   prof.cache_misses++;
 
   // [PHASE 5] Check if the bank we need was predictively prefetched
-  PrefetchState state = pf_state.load(std::memory_order_acquire);
+  PrefetchState p_state = pf_state.load(std::memory_order_acquire);
   int req_bank = pf_request_bank.load(std::memory_order_relaxed);
   
   if (req_bank == bank) {
-    if (state == PF_READY) {
+    if (p_state == PF_READY) {
       prof.prefetch_hits++;
       int slot = pf_active_slot.load(std::memory_order_relaxed);
       bank_to_slot[bank] = slot;
@@ -216,17 +208,17 @@ static uint8_t* cache_miss(int bank) {
       hot_bank_num = bank;
       hot_bank_slot = slot;
       return hot_bank_ptr;
-    } else if (state == PF_REQUESTED || state == PF_LOADING) {
+    } else if (p_state == PF_REQUESTED || p_state == PF_LOADING) {
       uint32_t t0 = micros();
       while (true) {
-        state = pf_state.load(std::memory_order_acquire);
-        if (state == PF_READY || state == PF_FREE) break;
+        p_state = pf_state.load(std::memory_order_acquire);
+        if (p_state == PF_READY || p_state == PF_FREE) break;
         if ((micros() - t0) >= 2000) break;
         taskYIELD();
       }
       prof.prefetch_wait_time_acc += (micros() - t0);
       
-      if (state == PF_READY) {
+      if (p_state == PF_READY) {
         prof.prefetch_hits++;
         int slot = pf_active_slot.load(std::memory_order_relaxed);
         bank_to_slot[bank] = slot;
@@ -245,26 +237,64 @@ static uint8_t* cache_miss(int bank) {
     }
   }
 
-  // [PHASE 3] Deterministic Cartridge-Aware Replacement
-  // Exclude Bank 0 (Slot 0), Active Bank, Prev Bank, and any slot actively LOADING by Core 1.
+  // [PHASE 5.5] Select victim slot safely. If all taken, cancel prefetch and wait.
   int victim_slot = -1;
-  for (int i = 1; i < CACHE_SLOTS; i++) {
-    if (i != hot_bank_slot && i != prev_bank_slot) {
-      state = pf_state.load(std::memory_order_acquire);
-      int pf_slot = pf_active_slot.load(std::memory_order_relaxed);
-      if (state != PF_FREE && i == pf_slot) continue;
-      
-      victim_slot = i;
-      break;
+  uint32_t t_victim = micros();
+  while (victim_slot == -1) {
+    for (int i = 1; i < CACHE_SLOTS; i++) {
+      if (i != hot_bank_slot && i != prev_bank_slot) {
+        p_state = pf_state.load(std::memory_order_acquire);
+        int pf_slot = pf_active_slot.load(std::memory_order_relaxed);
+        if (p_state != PF_FREE && i == pf_slot) continue;
+        
+        victim_slot = i;
+        break;
+      }
+    }
+    
+    if (victim_slot == -1) {
+      // All slots protected! We must wait for the prefetch to finish and FREE.
+      if ((micros() - t_victim) > 100000) { // 100ms timeout
+        Serial.println("FATAL: Cache victim timeout");
+        while(1) { taskYIELD(); }
+      }
+      taskYIELD();
     }
   }
   
-  if (victim_slot == -1) {
-    // If all other slots are pinned, active, or loading, evict the previous bank
-    victim_slot = prev_bank_slot;
-  }
+  int old = bank_cache[victim_slot].bank_num;
+  if (old >= 0 && old < MAX_BANKS) bank_to_slot[old] = -1;
+  bank_cache[victim_slot].bank_num = -1;
+
+  // [PHASE 5.5] Issue DEMAND to Core 1 sdTask
+  dem_bank.store(bank, std::memory_order_relaxed);
+  dem_slot.store(victim_slot, std::memory_order_relaxed);
+  dem_gen.fetch_add(1, std::memory_order_relaxed);
+  dem_state.store(DEMAND_REQUESTED, std::memory_order_release);
+  prof.demand_requests++;
   
-  cache_load_bank(victim_slot, bank);
+  if (sdTaskHandle) xTaskNotifyGive(sdTaskHandle);
+  
+  uint32_t t_wait = micros();
+  while (true) {
+    DemandState d_state = dem_state.load(std::memory_order_acquire);
+    if (d_state == DEMAND_READY) break;
+    if (d_state == DEMAND_ERROR) {
+      Serial.println("SD DEMAND ERROR!");
+      while (1) { taskYIELD(); }
+    }
+    if ((micros() - t_wait) > 150000) { // 150ms timeout
+      Serial.println("FATAL: SD DEMAND timeout");
+      while (1) { taskYIELD(); }
+    }
+    taskYIELD();
+  }
+  prof.demand_wait_time_acc += (micros() - t_wait);
+  
+  dem_state.store(DEMAND_FREE, std::memory_order_release);
+  
+  bank_cache[victim_slot].bank_num = bank;
+  bank_to_slot[bank] = victim_slot;
   
   prev_bank_slot = hot_bank_slot;
   hot_bank_ptr  = bank_cache[victim_slot].data;
@@ -317,7 +347,7 @@ uint32_t gb_rom_read_32bit(struct gb_s *gb, const uint_fast32_t addr) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// CART RAM — All SD access on Core 0 via HSPI
+// CART RAM - Saves are dispatched to Core 1 sdTask
 // ═══════════════════════════════════════════════════════════════
 #define SAVE_INTERVAL_FRAMES 300
 static char save_path[100];
@@ -327,10 +357,21 @@ static bool     cart_ram_dirty = false;
 
 void save_cart_ram() {
   if (!cart_ram_dirty || cart_ram_size == 0) return;
-  uint32_t t0 = micros();
-  File f = SD.open(save_path, FILE_WRITE);
-  if (f) { f.write(cart_ram_buf, cart_ram_size); f.close(); }
-  prof.save_time_acc += (micros() - t0);
+  
+  save_state.store(SAVE_REQUESTED, std::memory_order_release);
+  if (sdTaskHandle) xTaskNotifyGive(sdTaskHandle);
+  
+  while (true) {
+    SaveState s_state = save_state.load(std::memory_order_acquire);
+    if (s_state == SAVE_DONE) break;
+    if (s_state == SAVE_ERROR) {
+      Serial.println("SD SAVE ERROR!");
+      break;
+    }
+    taskYIELD();
+  }
+  
+  save_state.store(SAVE_FREE, std::memory_order_release);
   cart_ram_dirty = false;
 }
 
@@ -368,11 +409,6 @@ void gb_error(struct gb_s *gb, const enum gb_error_e gb_err,
 // ═══════════════════════════════════════════════════════════════
 // DUAL-CORE TFT RENDERING — Core 1 pushes via VSPI
 // ═══════════════════════════════════════════════════════════════
-// Core 0 emulates and writes to the framebuffer.
-// Core 1 pushes the completed framebuffer to the TFT.
-// Because TFT (VSPI) and SD (HSPI) are on separate physical
-// buses, a cache miss on Core 0 NEVER blocks the TFT push,
-// and the TFT push NEVER blocks an SD read. True parallel I/O.
 #define GB_W      160
 #define GB_H      144
 #define FB_PIXELS (GB_W * GB_H)
@@ -383,7 +419,6 @@ void gb_error(struct gb_s *gb, const enum gb_error_e gb_err,
 static uint16_t *framebuffer = NULL;
 static bool frame_drawn = false;
 
-// Render handoff: Core 0 sets this, Core 1 clears it after push.
 static uint16_t * volatile render_buffer = NULL;
 static TaskHandle_t renderTaskHandle = NULL;
 
@@ -419,17 +454,15 @@ void gb_rom_bank_changed_callback(struct gb_s* gb, uint16_t new_bank) {
     pf_state.store(PF_REQUESTED, std::memory_order_release);
     prof.prefetch_requests++;
     
-    if (renderTaskHandle) xTaskNotify(renderTaskHandle, 0x02, eSetBits);
+    if (sdTaskHandle) xTaskNotifyGive(sdTaskHandle);
   }
 }
 
-// Core 1 Service Task: Handles both TFT VSPI and Prefetch HSPI
+// Core 1 High-Priority Task: TFT VSPI
 void renderTask(void *pvParameters) {
   for (;;) {
-    uint32_t flags = 0;
-    xTaskNotifyWait(0x00, 0xFFFFFFFF, &flags, portMAX_DELAY);
-
-    if ((flags & 0x01) && render_buffer) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (render_buffer) {
       uint32_t t0 = micros();
       tft.startWrite();
       tft.setAddrWindow(OFFSET_X, OFFSET_Y, GB_W, GB_H);
@@ -438,38 +471,111 @@ void renderTask(void *pvParameters) {
       prof.tft_time_acc += (micros() - t0);
       render_buffer = NULL;
     }
+  }
+}
 
-    if (flags & 0x02) {
-      PrefetchState state = pf_state.load(std::memory_order_acquire);
-      if (state == PF_REQUESTED) {
-        // Capture locally
-        uint32_t my_gen = pf_request_gen.load(std::memory_order_relaxed);
-        int my_slot = pf_active_slot.load(std::memory_order_relaxed);
-        int my_bank = pf_request_bank.load(std::memory_order_relaxed);
-        
-        pf_state.store(PF_LOADING, std::memory_order_release);
-        
-        uint32_t offset = (uint32_t)my_bank * BANK_SIZE;
-        size_t to_read = BANK_SIZE;
-        if (offset + to_read > rom_total_size) {
-          to_read = rom_total_size - offset;
+// Core 1 Low-Priority Task: SD I/O (HSPI)
+void sdTask(void *pvParameters) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    
+    // 1. DEMAND Priority
+    DemandState d_state = dem_state.load(std::memory_order_acquire);
+    if (d_state == DEMAND_REQUESTED) {
+      uint32_t my_gen = dem_gen.load(std::memory_order_relaxed);
+      int my_slot = dem_slot.load(std::memory_order_relaxed);
+      int my_bank = dem_bank.load(std::memory_order_relaxed);
+      
+      dem_state.store(DEMAND_LOADING, std::memory_order_release);
+      
+      uint32_t offset = (uint32_t)my_bank * BANK_SIZE;
+      size_t to_read = BANK_SIZE;
+      if (offset + to_read > rom_total_size) {
+        to_read = rom_total_size - offset;
+      }
+      
+      uint32_t t0 = micros();
+      bool success = rom_file.seek(offset);
+      if (success) {
+        size_t read_bytes = rom_file.read(bank_cache[my_slot].data, to_read);
+        if (read_bytes != to_read && to_read > 0) success = false;
+      }
+      prof.sd_time_acc += (micros() - t0);
+      
+      uint32_t current_gen = dem_gen.load(std::memory_order_acquire);
+      if (current_gen == my_gen) {
+        if (success) {
+          dem_state.store(DEMAND_READY, std::memory_order_release);
+        } else {
+          dem_state.store(DEMAND_ERROR, std::memory_order_release);
         }
-        
-        uint32_t t0 = micros();
-        rom_file.seek(offset);
-        rom_file.read(bank_cache[my_slot].data, to_read);
-        prof.sd_time_acc += (micros() - t0);
-        
-        uint32_t current_gen = pf_request_gen.load(std::memory_order_acquire);
-        if (current_gen == my_gen) {
+      } else {
+        dem_state.store(DEMAND_FREE, std::memory_order_release);
+      }
+      if (sdTaskHandle) xTaskNotifyGive(sdTaskHandle); // Loop again
+      continue;
+    }
+    
+    // 2. PREFETCH Priority
+    PrefetchState p_state = pf_state.load(std::memory_order_acquire);
+    if (p_state == PF_REQUESTED) {
+      uint32_t my_gen = pf_request_gen.load(std::memory_order_relaxed);
+      int my_slot = pf_active_slot.load(std::memory_order_relaxed);
+      int my_bank = pf_request_bank.load(std::memory_order_relaxed);
+      
+      pf_state.store(PF_LOADING, std::memory_order_release);
+      
+      uint32_t offset = (uint32_t)my_bank * BANK_SIZE;
+      size_t to_read = BANK_SIZE;
+      if (offset + to_read > rom_total_size) {
+        to_read = rom_total_size - offset;
+      }
+      
+      uint32_t t0 = micros();
+      bool success = rom_file.seek(offset);
+      if (success) {
+        size_t read_bytes = rom_file.read(bank_cache[my_slot].data, to_read);
+        if (read_bytes != to_read && to_read > 0) success = false;
+      }
+      prof.sd_time_acc += (micros() - t0);
+      
+      uint32_t current_gen = pf_request_gen.load(std::memory_order_acquire);
+      if (current_gen == my_gen) {
+        if (success) {
           bank_cache[my_slot].bank_num = my_bank;
           pf_state.store(PF_READY, std::memory_order_release);
         } else {
-          // Cancelled mid-flight or stale
           pf_state.store(PF_FREE, std::memory_order_release);
-          prof.prefetch_wasted_bytes += to_read;
           prof.prefetch_cancellations++;
         }
+      } else {
+        pf_state.store(PF_FREE, std::memory_order_release);
+        prof.prefetch_wasted_bytes += to_read;
+        prof.prefetch_cancellations++;
+      }
+      if (sdTaskHandle) xTaskNotifyGive(sdTaskHandle);
+      continue;
+    }
+    
+    // 3. SAVE Priority
+    SaveState s_state = save_state.load(std::memory_order_acquire);
+    if (s_state == SAVE_REQUESTED) {
+      save_state.store(SAVE_WRITING, std::memory_order_release);
+      
+      uint32_t t0 = micros();
+      bool success = false;
+      File f = SD.open(save_path, FILE_WRITE);
+      if (f) {
+        size_t written = f.write(cart_ram_buf, cart_ram_size);
+        f.close();
+        if (written == cart_ram_size) success = true;
+      }
+      prof.save_time_acc += (micros() - t0);
+      
+      if (success) {
+        save_state.store(SAVE_DONE, std::memory_order_release);
+      } else {
+        save_state.store(SAVE_ERROR, std::memory_order_release);
       }
     }
   }
@@ -664,11 +770,21 @@ void setup() {
 
   gb_init_lcd(gb, &lcd_draw_line);
   gb->direct.interlace = 0;
-  cache_load_bank(0, 0);
+  
+  uint32_t to_read = BANK_SIZE;
+  if (to_read > rom_total_size) to_read = rom_total_size;
+  rom_file.seek(0);
+  rom_file.read(bank_cache[0].data, to_read);
+  bank_cache[0].bank_num = 0;
+  bank_to_slot[0] = 0;
 
-  // Launch Core 1 render task — owns VSPI exclusively
-  xTaskCreatePinnedToCore(renderTask, "Render", 3072, NULL, 1,
+  // Launch Core 1 High-Priority render task — owns VSPI exclusively
+  xTaskCreatePinnedToCore(renderTask, "Render", 3072, NULL, 2,
                           &renderTaskHandle, 1);
+
+  // Launch Core 1 Low-Priority sd task — owns HSPI exclusively
+  xTaskCreatePinnedToCore(sdTask, "SDTask", 2560, NULL, 1,
+                          &sdTaskHandle, 1);
 
   tft.fillScreen(ILI9341_BLACK);
   Serial.printf("Game start. Free: %u  Largest: %u\n",
@@ -679,8 +795,8 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════
 // MAIN LOOP — Core 0
 // ═══════════════════════════════════════════════════════════════
-// Core 0: emulation + SD reads (HSPI)
-// Core 1: TFT push (VSPI)
+// Core 0: emulation + cache/request logic
+// Core 1: TFT + all runtime SD access
 // These run on PHYSICALLY SEPARATE SPI buses. A cache miss on
 // Core 0 NEVER stalls the TFT, and the TFT NEVER stalls SD.
 void loop() {
@@ -714,10 +830,10 @@ void loop() {
   // ── Hand off to Core 1 for TFT push ───────────────────────
   if (frame_drawn) {
     render_buffer = framebuffer;
-    xTaskNotify(renderTaskHandle, 0x01, eSetBits);
+    xTaskNotifyGive(renderTaskHandle);
   }
 
-  // ── Auto-save (Core 0 only, via HSPI) ─────────────────────
+  // ── Auto-save (Core 0 requests, Core 1 executes) ────────────
   if (frame_count % SAVE_INTERVAL_FRAMES == 0 && cart_ram_dirty) {
     save_cart_ram();
   }
@@ -738,6 +854,8 @@ void loop() {
       "TFT Push: %u ms/f\n"
       "SD Misses: %u\n"
       "SD Time: %u ms/miss\n"
+      "Dem Reqs: %u\n"
+      "Dem Wait: %u ms/f\n"
       "PF Reqs: %u\n"
       "PF Hits: %u\n"
       "PF Cancels: %u\n"
@@ -748,7 +866,8 @@ void loop() {
       "Loop Total: %u ms/f (%.1f FPS)\n"
       "Min Free: %u\n"
       "Max Block: %u\n"
-      "Core1 Stack: %u\n"
+      "C1 Render Stack: %u\n"
+      "C1 SD Stack: %u\n"
       "==============================",
       prof.emu_time_acc / 300000,
       prof.ppu_time_acc / 300000,
@@ -756,6 +875,8 @@ void loop() {
       prof.tft_time_acc / 300000,
       prof.cache_misses,
       prof.cache_misses ? (prof.sd_time_acc / 1000) / prof.cache_misses : 0,
+      prof.demand_requests,
+      prof.demand_wait_time_acc / 300000,
       prof.prefetch_requests,
       prof.prefetch_hits,
       prof.prefetch_cancellations,
@@ -767,7 +888,8 @@ void loop() {
       300000000.0f / prof.loop_time_acc,
       prof.min_free_heap,
       ESP.getMaxAllocHeap(),
-      uxTaskGetStackHighWaterMark(renderTaskHandle)
+      uxTaskGetStackHighWaterMark(renderTaskHandle),
+      uxTaskGetStackHighWaterMark(sdTaskHandle)
     );
     Serial.println(buf);
     reset_prof();
