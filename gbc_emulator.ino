@@ -11,6 +11,36 @@
 #include "walnut_cgb.h"
 
 // ═══════════════════════════════════════════════════════════════
+// PROFILING
+// ═══════════════════════════════════════════════════════════════
+struct ProfileData {
+  uint32_t emu_time_acc;
+  uint32_t ppu_time_acc;
+  uint32_t core0_wait_acc;
+  volatile uint32_t tft_time_acc;
+  uint32_t sd_time_acc;
+  uint32_t save_time_acc;
+  uint32_t cache_misses;
+  uint32_t loop_time_acc;
+  uint32_t frames;
+  uint32_t min_free_heap;
+};
+static ProfileData prof;
+
+static void reset_prof() {
+  prof.emu_time_acc = 0;
+  prof.ppu_time_acc = 0;
+  prof.core0_wait_acc = 0;
+  prof.tft_time_acc = 0;
+  prof.sd_time_acc = 0;
+  prof.save_time_acc = 0;
+  prof.cache_misses = 0;
+  prof.loop_time_acc = 0;
+  prof.frames = 0;
+  prof.min_free_heap = ESP.getFreeHeap();
+}
+
+// ═══════════════════════════════════════════════════════════════
 // PIN CONFIGURATION — DUAL SPI BUS ARCHITECTURE
 // ═══════════════════════════════════════════════════════════════
 //
@@ -119,8 +149,10 @@ static void cache_load_bank(int slot, int bank) {
     memset(bank_cache[slot].data + to_read, 0xFF, BANK_SIZE - to_read);
   }
 
+  uint32_t t0 = micros();
   rom_file.seek(offset);
   rom_file.read(bank_cache[slot].data, to_read);
+  prof.sd_time_acc += (micros() - t0);
 
   bank_cache[slot].bank_num = bank;
   if (bank < MAX_BANKS) bank_to_slot[bank] = slot;
@@ -153,6 +185,7 @@ static uint8_t* cache_miss(int bank) {
     }
   }
   if (lru_slot < 0) lru_slot = 1;
+  prof.cache_misses++;
   cache_load_bank(lru_slot, bank);
   bank_cache[lru_slot].last_frame_used = frame_count;
   hot_bank_ptr  = bank_cache[lru_slot].data;
@@ -214,8 +247,10 @@ static bool     cart_ram_dirty = false;
 
 void save_cart_ram() {
   if (!cart_ram_dirty || cart_ram_size == 0) return;
+  uint32_t t0 = micros();
   File f = SD.open(save_path, FILE_WRITE);
   if (f) { f.write(cart_ram_buf, cart_ram_size); f.close(); }
+  prof.save_time_acc += (micros() - t0);
   cart_ram_dirty = false;
 }
 
@@ -277,10 +312,12 @@ void renderTask(void *pvParameters) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     if (render_buffer) {
+      uint32_t t0 = micros();
       tft.startWrite();
       tft.setAddrWindow(OFFSET_X, OFFSET_Y, GB_W, GB_H);
       tft.writePixels((uint16_t*)render_buffer, FB_PIXELS);
       tft.endWrite();
+      prof.tft_time_acc += (micros() - t0);
       render_buffer = NULL;
     }
   }
@@ -288,6 +325,7 @@ void renderTask(void *pvParameters) {
 
 void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
                    const uint_fast8_t line) {
+  uint32_t t0 = micros();
   frame_drawn = true;
   uint16_t *dst = &framebuffer[line * GB_W];
   if (gb->cgb.cgbMode) {
@@ -297,6 +335,7 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
     for (unsigned int x = 0; x < GB_W; x++)
       dst[x] = CURRENT_PALETTE_RGB565[pixels[x] & 3];
   }
+  prof.ppu_time_acc += (micros() - t0);
 }
 
 void debugPrint(const char* str) {
@@ -478,6 +517,7 @@ void setup() {
   tft.fillScreen(ILI9341_BLACK);
   Serial.printf("Game start. Free: %u  Largest: %u\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  reset_prof();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -488,12 +528,15 @@ void setup() {
 // These run on PHYSICALLY SEPARATE SPI buses. A cache miss on
 // Core 0 NEVER stalls the TFT, and the TFT NEVER stalls SD.
 void loop() {
+  uint32_t loop_start = micros();
   frame_count++;
 
   // Wait for Core 1 to finish previous TFT push before
   // writing to the framebuffer. If emulation (~15ms) is
   // slower than TFT push (~9ms), this wait is ZERO.
+  uint32_t wait_start = micros();
   while (render_buffer != NULL) { taskYIELD(); }
+  prof.core0_wait_acc += (micros() - wait_start);
 
   // ── Joypad ─────────────────────────────────────────────────
   gb->direct.joypad = 0xFF;
@@ -507,8 +550,10 @@ void loop() {
   if (digitalRead(BTN_SELECT)==LOW) gb->direct.joypad_bits.select = 0;
 
   // ── Emulate one frame ──────────────────────────────────────
+  uint32_t emu_start = micros();
   frame_drawn = false;
   gb_run_frame_dualfetch(gb);
+  prof.emu_time_acc += (micros() - emu_start);
 
   // ── Hand off to Core 1 for TFT push ───────────────────────
   if (frame_drawn) {
@@ -520,4 +565,44 @@ void loop() {
   if (frame_count % SAVE_INTERVAL_FRAMES == 0 && cart_ram_dirty) {
     save_cart_ram();
   }
+
+  prof.loop_time_acc += (micros() - loop_start);
+  prof.frames++;
+  
+  uint32_t fh = ESP.getFreeHeap();
+  if (fh < prof.min_free_heap) prof.min_free_heap = fh;
+
+  if (prof.frames >= 300) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+      "\n=== PROFILING (300 frames) ===\n"
+      "Emulation: %u ms/f\n"
+      "PPU (draw): %u ms/f\n"
+      "Core0 Wait: %u ms/f\n"
+      "TFT Push: %u ms/f\n"
+      "SD Misses: %u\n"
+      "SD Time: %u ms/miss\n"
+      "Save Time: %u ms\n"
+      "Loop Total: %u ms/f (%.1f FPS)\n"
+      "Min Free: %u\n"
+      "Max Block: %u\n"
+      "Core1 Stack: %u\n"
+      "==============================",
+      prof.emu_time_acc / 300000,
+      prof.ppu_time_acc / 300000,
+      prof.core0_wait_acc / 300000,
+      prof.tft_time_acc / 300000,
+      prof.cache_misses,
+      prof.cache_misses ? (prof.sd_time_acc / 1000) / prof.cache_misses : 0,
+      (prof.save_time_acc / 1000),
+      prof.loop_time_acc / 300000,
+      300000000.0f / prof.loop_time_acc,
+      prof.min_free_heap,
+      ESP.getMaxAllocHeap(),
+      uxTaskGetStackHighWaterMark(renderTaskHandle)
+    );
+    Serial.println(buf);
+    reset_prof();
+  }
 }
+
