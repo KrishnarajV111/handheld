@@ -732,6 +732,9 @@ struct gb_s
 	/* Read byte from boot ROM at given address. */
 	uint8_t (*gb_bootrom_read)(struct gb_s*, const uint_fast16_t addr);
 
+	/* Notification when MBC changes selected ROM bank */
+	void (*gb_rom_bank_changed)(struct gb_s*, uint16_t new_bank);
+
 	struct
 	{
 		bool gb_halt	: 1;
@@ -1700,6 +1703,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 #if WALNUT_GB_SAFE_DUALFETCH_MBC
 			gb->prefetch_invalid=true;
 #endif
+			if (gb->gb_rom_bank_changed) gb->gb_rom_bank_changed(gb, gb->selected_rom_bank);
 			return;
 		}
 
@@ -1749,6 +1753,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 #if WALNUT_GB_SAFE_DUALFETCH_MBC
 		gb->prefetch_invalid=true;
 #endif
+		if (gb->gb_rom_bank_changed) gb->gb_rom_bank_changed(gb, gb->selected_rom_bank);
 		return;
 
 	case 0x4:
@@ -1758,6 +1763,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			gb->cart_ram_bank = (val & 3);
 			gb->selected_rom_bank = ((val & 3) << 5) | (gb->selected_rom_bank & 0x1F);
 			gb->selected_rom_bank = gb->selected_rom_bank & gb->num_rom_banks_mask;
+			if (gb->gb_rom_bank_changed) gb->gb_rom_bank_changed(gb, gb->selected_rom_bank);
 		}
 		else if(gb->mbc == 3)
 		{

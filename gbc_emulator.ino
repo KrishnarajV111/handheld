@@ -11,6 +11,40 @@
 #include "walnut_cgb.h"
 
 // ═══════════════════════════════════════════════════════════════
+// PROFILING
+// ═══════════════════════════════════════════════════════════════
+struct ProfileData {
+  uint32_t emu_time_acc;
+  uint32_t ppu_time_acc;
+  uint32_t core0_wait_acc;
+  volatile uint32_t tft_time_acc;
+  uint32_t sd_time_acc;
+  uint32_t save_time_acc;
+  uint32_t cache_misses;
+  uint32_t prefetch_hits;
+  uint32_t prefetch_aborts;
+  uint32_t loop_time_acc;
+  uint32_t frames;
+  uint32_t min_free_heap;
+};
+static ProfileData prof;
+
+static void reset_prof() {
+  prof.emu_time_acc = 0;
+  prof.ppu_time_acc = 0;
+  prof.core0_wait_acc = 0;
+  prof.tft_time_acc = 0;
+  prof.sd_time_acc = 0;
+  prof.save_time_acc = 0;
+  prof.cache_misses = 0;
+  prof.prefetch_hits = 0;
+  prof.prefetch_aborts = 0;
+  prof.loop_time_acc = 0;
+  prof.frames = 0;
+  prof.min_free_heap = ESP.getFreeHeap();
+}
+
+// ═══════════════════════════════════════════════════════════════
 // PIN CONFIGURATION — DUAL SPI BUS ARCHITECTURE
 // ═══════════════════════════════════════════════════════════════
 //
@@ -90,16 +124,23 @@ uint16_t CURRENT_PALETTE_RGB565[4] = { 0x7BEF, 0x5BE8, 0x3AD1, 0x2A29 };
 struct CacheSlot {
   uint8_t  *data;
   int16_t  bank_num;
-  uint32_t last_frame_used;
 };
 
 static CacheSlot bank_cache[CACHE_SLOTS];
 static uint8_t  *cache_base = NULL;
 static int8_t    bank_to_slot[MAX_BANKS];
 
+// [PHASE 3] Cartridge-aware replacement: Active & Prev slots
 static uint8_t *hot_bank_ptr  = NULL;
 static int      hot_bank_num  = -1;
 static int      hot_bank_slot = -1;
+static int      prev_bank_slot = -1;
+
+// [PHASE 5] Predictive Prefetch State
+enum PrefetchState { PF_FREE = 0, PF_LOADING = 1, PF_READY = 2 };
+static volatile PrefetchState pf_state = PF_FREE;
+static volatile int pf_request_bank = -1;
+static volatile int pf_active_slot = -1;
 
 static File     rom_file;
 static uint32_t rom_total_size;
@@ -119,20 +160,22 @@ static void cache_load_bank(int slot, int bank) {
     memset(bank_cache[slot].data + to_read, 0xFF, BANK_SIZE - to_read);
   }
 
+  uint32_t t0 = micros();
   rom_file.seek(offset);
   rom_file.read(bank_cache[slot].data, to_read);
+  prof.sd_time_acc += (micros() - t0);
 
   bank_cache[slot].bank_num = bank;
   if (bank < MAX_BANKS) bank_to_slot[bank] = slot;
 }
 
+// [PHASE 4] ROM Access Hot-Path: Minimal branches, manually inlined.
 static inline uint8_t* __attribute__((always_inline))
-resolve_bank(int bank) {
-  if (bank == hot_bank_num) return hot_bank_ptr;
+resolve_bank_l2(int bank) {
   if (bank < MAX_BANKS) {
     int8_t slot = bank_to_slot[bank];
     if (slot >= 0) {
-      bank_cache[slot].last_frame_used = frame_count;
+      prev_bank_slot = hot_bank_slot;
       hot_bank_ptr  = bank_cache[slot].data;
       hot_bank_num  = bank;
       hot_bank_slot = slot;
@@ -143,64 +186,104 @@ resolve_bank(int bank) {
 }
 
 static uint8_t* cache_miss(int bank) {
-  int lru_slot = -1;
-  uint32_t oldest = UINT32_MAX;
-  for (int i = 1; i < CACHE_SLOTS; i++) {
-    if (i == hot_bank_slot) continue;
-    if (bank_cache[i].last_frame_used < oldest) {
-      oldest = bank_cache[i].last_frame_used;
-      lru_slot = i;
+  prof.cache_misses++;
+
+  // [PHASE 5] Check if the bank we need was predictively prefetched
+  if (pf_request_bank == bank) {
+    if (pf_state == PF_READY && pf_active_slot > 0) {
+      prof.prefetch_hits++;
+      int slot = pf_active_slot;
+      bank_to_slot[bank] = slot;
+      pf_state = PF_FREE; // Slot is officially part of normal cache now
+      
+      prev_bank_slot = hot_bank_slot;
+      hot_bank_ptr = bank_cache[slot].data;
+      hot_bank_num = bank;
+      hot_bank_slot = slot;
+      return hot_bank_ptr;
+    } else if (pf_state == PF_LOADING) {
+      // Core 1 is currently loading it. Wait a tiny bit (synchronous fallback).
+      uint32_t t0 = micros();
+      while (pf_state == PF_LOADING && (micros() - t0) < 3000) { taskYIELD(); }
+      
+      if (pf_state == PF_READY) {
+        prof.prefetch_hits++;
+        int slot = pf_active_slot;
+        bank_to_slot[bank] = slot;
+        pf_state = PF_FREE;
+        
+        prev_bank_slot = hot_bank_slot;
+        hot_bank_ptr = bank_cache[slot].data;
+        hot_bank_num = bank;
+        hot_bank_slot = slot;
+        return hot_bank_ptr;
+      } else {
+        prof.prefetch_aborts++;
+      }
     }
   }
-  if (lru_slot < 0) lru_slot = 1;
-  cache_load_bank(lru_slot, bank);
-  bank_cache[lru_slot].last_frame_used = frame_count;
-  hot_bank_ptr  = bank_cache[lru_slot].data;
+
+  // [PHASE 3] Deterministic Cartridge-Aware Replacement
+  // Exclude Bank 0 (Slot 0), Active Bank, Prev Bank, and any slot actively LOADING by Core 1.
+  int victim_slot = 1;
+  for (int i = 1; i < CACHE_SLOTS; i++) {
+    if (i != hot_bank_slot && i != prev_bank_slot) {
+      if (pf_state == PF_LOADING && i == pf_active_slot) continue;
+      victim_slot = i;
+      break;
+    }
+  }
+  
+  cache_load_bank(victim_slot, bank);
+  
+  prev_bank_slot = hot_bank_slot;
+  hot_bank_ptr  = bank_cache[victim_slot].data;
   hot_bank_num  = bank;
-  hot_bank_slot = lru_slot;
+  hot_bank_slot = victim_slot;
   return hot_bank_ptr;
 }
 
-static inline uint8_t cache_read_byte(uint32_t addr) {
-  int bank   = addr >> 14;
-  int offset = addr & 0x3FFF;
-  if (bank == 0) return bank_cache[0].data[offset];
-  uint8_t *data = resolve_bank(bank);
-  if (data) return data[offset];
-  return cache_miss(bank)[offset];
-}
-
 uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr) {
-  return cache_read_byte(addr);
+  uint32_t bank = addr >> 14;
+  uint32_t offset = addr & 0x3FFF;
+  if (bank == 0) return bank_cache[0].data[offset];
+  if (bank == hot_bank_num) return hot_bank_ptr[offset];
+  
+  uint8_t *data = resolve_bank_l2(bank);
+  if (!data) data = cache_miss(bank);
+  return data[offset];
 }
 
 uint16_t gb_rom_read_16bit(struct gb_s *gb, const uint_fast32_t addr) {
-  int bank = addr >> 14, offset = addr & 0x3FFF;
+  uint32_t bank = addr >> 14;
+  uint32_t offset = addr & 0x3FFF;
   if (offset < BANK_SIZE - 1) {
     uint8_t *data;
     if (bank == 0) data = bank_cache[0].data;
-    else { data = resolve_bank(bank); if (!data) data = cache_miss(bank); }
-    return ((uint16_t)data[offset]) | ((uint16_t)data[offset + 1] << 8);
+    else if (bank == hot_bank_num) data = hot_bank_ptr;
+    else {
+      data = resolve_bank_l2(bank);
+      if (!data) data = cache_miss(bank);
+    }
+    return data[offset] | (data[offset + 1] << 8);
   }
-  return ((uint16_t)cache_read_byte(addr)) |
-         ((uint16_t)cache_read_byte(addr + 1) << 8);
+  return gb_rom_read(gb, addr) | (gb_rom_read(gb, addr + 1) << 8);
 }
 
 uint32_t gb_rom_read_32bit(struct gb_s *gb, const uint_fast32_t addr) {
-  int bank = addr >> 14, offset = addr & 0x3FFF;
+  uint32_t bank = addr >> 14;
+  uint32_t offset = addr & 0x3FFF;
   if (offset < BANK_SIZE - 3) {
     uint8_t *data;
     if (bank == 0) data = bank_cache[0].data;
-    else { data = resolve_bank(bank); if (!data) data = cache_miss(bank); }
-    return ((uint32_t)data[offset])         |
-           ((uint32_t)data[offset + 1] << 8)  |
-           ((uint32_t)data[offset + 2] << 16) |
-           ((uint32_t)data[offset + 3] << 24);
+    else if (bank == hot_bank_num) data = hot_bank_ptr;
+    else {
+      data = resolve_bank_l2(bank);
+      if (!data) data = cache_miss(bank);
+    }
+    return data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24);
   }
-  return ((uint32_t)cache_read_byte(addr))         |
-         ((uint32_t)cache_read_byte(addr + 1) << 8) |
-         ((uint32_t)cache_read_byte(addr + 2) << 16) |
-         ((uint32_t)cache_read_byte(addr + 3) << 24);
+  return gb_rom_read(gb, addr) | (gb_rom_read(gb, addr + 1) << 8) | (gb_rom_read(gb, addr + 2) << 16) | (gb_rom_read(gb, addr + 3) << 24);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -214,8 +297,10 @@ static bool     cart_ram_dirty = false;
 
 void save_cart_ram() {
   if (!cart_ram_dirty || cart_ram_size == 0) return;
+  uint32_t t0 = micros();
   File f = SD.open(save_path, FILE_WRITE);
   if (f) { f.write(cart_ram_buf, cart_ram_size); f.close(); }
+  prof.save_time_acc += (micros() - t0);
   cart_ram_dirty = false;
 }
 
@@ -272,22 +357,79 @@ static bool frame_drawn = false;
 static uint16_t * volatile render_buffer = NULL;
 static TaskHandle_t renderTaskHandle = NULL;
 
-// Core 1 render task — owns VSPI exclusively
+// [PHASE 5] Callback from Walnut when MBC bank changes
+void gb_rom_bank_changed_callback(struct gb_s* gb, uint16_t new_bank) {
+  if (new_bank == hot_bank_num) return;
+  if (new_bank < MAX_BANKS && bank_to_slot[new_bank] >= 0) return; 
+
+  if (pf_state == PF_READY) {
+    if (pf_request_bank == new_bank) return;
+    pf_state = PF_FREE; // Discard stale completed prefetch
+  }
+
+  if (pf_state == PF_FREE) {
+    int victim = 1;
+    for (int i = 1; i < CACHE_SLOTS; i++) {
+      if (i != hot_bank_slot && i != prev_bank_slot) { victim = i; break; }
+    }
+    // Safely invalidate victim metadata on Core 0
+    int old = bank_cache[victim].bank_num;
+    if (old >= 0 && old < MAX_BANKS) bank_to_slot[old] = -1;
+    bank_cache[victim].bank_num = -1;
+    
+    pf_request_bank = new_bank;
+    pf_active_slot = victim;
+    if (renderTaskHandle) xTaskNotify(renderTaskHandle, 0x02, eSetBits);
+  }
+}
+
+// Core 1 Service Task: Handles both TFT VSPI and Prefetch HSPI
 void renderTask(void *pvParameters) {
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    if (render_buffer) {
+    uint32_t flags = 0;
+    xTaskNotifyWait(0x00, 0xFFFFFFFF, &flags, portMAX_DELAY);
+
+    if ((flags & 0x01) && render_buffer) {
+      uint32_t t0 = micros();
       tft.startWrite();
       tft.setAddrWindow(OFFSET_X, OFFSET_Y, GB_W, GB_H);
       tft.writePixels((uint16_t*)render_buffer, FB_PIXELS);
       tft.endWrite();
+      prof.tft_time_acc += (micros() - t0);
       render_buffer = NULL;
+    }
+
+    if (flags & 0x02) {
+      if (pf_state == PF_FREE && pf_request_bank >= 0 && pf_active_slot > 0) {
+        pf_state = PF_LOADING;
+        int req = pf_request_bank;
+        int slot = pf_active_slot;
+        
+        uint32_t offset = (uint32_t)req * BANK_SIZE;
+        size_t to_read = BANK_SIZE;
+        if (offset + to_read > rom_total_size) {
+          to_read = rom_total_size - offset;
+        }
+        
+        uint32_t t0 = micros();
+        rom_file.seek(offset);
+        rom_file.read(bank_cache[slot].data, to_read);
+        prof.sd_time_acc += (micros() - t0);
+        
+        if (pf_request_bank == req) {
+          bank_cache[slot].bank_num = req;
+          pf_state = PF_READY;
+        } else {
+          pf_state = PF_FREE; // Cancelled mid-flight
+        }
+      }
     }
   }
 }
 
 void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
                    const uint_fast8_t line) {
+  uint32_t t0 = micros();
   frame_drawn = true;
   uint16_t *dst = &framebuffer[line * GB_W];
   if (gb->cgb.cgbMode) {
@@ -297,6 +439,7 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[160],
     for (unsigned int x = 0; x < GB_W; x++)
       dst[x] = CURRENT_PALETTE_RGB565[pixels[x] & 3];
   }
+  prof.ppu_time_acc += (micros() - t0);
 }
 
 void debugPrint(const char* str) {
@@ -410,8 +553,9 @@ void setup() {
   for (int i = 0; i < CACHE_SLOTS; i++) {
     bank_cache[i].data = cache_base + (i * BANK_SIZE);
     bank_cache[i].bank_num = -1;
-    bank_cache[i].last_frame_used = 0;
   }
+  hot_bank_slot = 1;
+  prev_bank_slot = 2;
 
   Serial.printf("Free: %u  Largest: %u\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
@@ -430,7 +574,9 @@ void setup() {
   // Initialize HSPI (SD Card) — SEPARATE physical bus!
   hspi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   debugPrint("Init SD (HSPI)...");
-  if (!SD.begin(SD_CS, hspi, 4000000)) {
+  // [PHASE 2] SD Optimization: Increased from 4MHz to 8MHz
+  #define SD_SPI_SPEED 8000000 
+  if (!SD.begin(SD_CS, hspi, SD_SPI_SPEED)) {
     debugPrint("SD Failed!");
     while (1);
   }
@@ -454,6 +600,7 @@ void setup() {
 
   gb_init(gb, &gb_rom_read, &gb_rom_read_16bit, &gb_rom_read_32bit,
           &gb_cart_ram_read, &gb_cart_ram_write, &gb_error, &priv);
+  gb->gb_rom_bank_changed = &gb_rom_bank_changed_callback;
 
   cart_ram_size = gb_get_save_size(gb);
   if (cart_ram_size > 0) {
@@ -478,6 +625,7 @@ void setup() {
   tft.fillScreen(ILI9341_BLACK);
   Serial.printf("Game start. Free: %u  Largest: %u\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  reset_prof();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -488,12 +636,15 @@ void setup() {
 // These run on PHYSICALLY SEPARATE SPI buses. A cache miss on
 // Core 0 NEVER stalls the TFT, and the TFT NEVER stalls SD.
 void loop() {
+  uint32_t loop_start = micros();
   frame_count++;
 
   // Wait for Core 1 to finish previous TFT push before
   // writing to the framebuffer. If emulation (~15ms) is
   // slower than TFT push (~9ms), this wait is ZERO.
+  uint32_t wait_start = micros();
   while (render_buffer != NULL) { taskYIELD(); }
+  prof.core0_wait_acc += (micros() - wait_start);
 
   // ── Joypad ─────────────────────────────────────────────────
   gb->direct.joypad = 0xFF;
@@ -507,17 +658,63 @@ void loop() {
   if (digitalRead(BTN_SELECT)==LOW) gb->direct.joypad_bits.select = 0;
 
   // ── Emulate one frame ──────────────────────────────────────
+  uint32_t emu_start = micros();
   frame_drawn = false;
   gb_run_frame_dualfetch(gb);
+  prof.emu_time_acc += (micros() - emu_start);
 
   // ── Hand off to Core 1 for TFT push ───────────────────────
   if (frame_drawn) {
     render_buffer = framebuffer;
-    xTaskNotifyGive(renderTaskHandle);
+    xTaskNotify(renderTaskHandle, 0x01, eSetBits);
   }
 
   // ── Auto-save (Core 0 only, via HSPI) ─────────────────────
   if (frame_count % SAVE_INTERVAL_FRAMES == 0 && cart_ram_dirty) {
     save_cart_ram();
   }
+
+  prof.loop_time_acc += (micros() - loop_start);
+  prof.frames++;
+  
+  uint32_t fh = ESP.getFreeHeap();
+  if (fh < prof.min_free_heap) prof.min_free_heap = fh;
+
+  if (prof.frames >= 300) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+      "\n=== PROFILING (300 frames) ===\n"
+      "Emulation: %u ms/f\n"
+      "PPU (draw): %u ms/f\n"
+      "Core0 Wait: %u ms/f\n"
+      "TFT Push: %u ms/f\n"
+      "SD Misses: %u\n"
+      "SD Time: %u ms/miss\n"
+      "PF Hits: %u\n"
+      "PF Aborts: %u\n"
+      "Save Time: %u ms\n"
+      "Loop Total: %u ms/f (%.1f FPS)\n"
+      "Min Free: %u\n"
+      "Max Block: %u\n"
+      "Core1 Stack: %u\n"
+      "==============================",
+      prof.emu_time_acc / 300000,
+      prof.ppu_time_acc / 300000,
+      prof.core0_wait_acc / 300000,
+      prof.tft_time_acc / 300000,
+      prof.cache_misses,
+      prof.cache_misses ? (prof.sd_time_acc / 1000) / prof.cache_misses : 0,
+      prof.prefetch_hits,
+      prof.prefetch_aborts,
+      (prof.save_time_acc / 1000),
+      prof.loop_time_acc / 300000,
+      300000000.0f / prof.loop_time_acc,
+      prof.min_free_heap,
+      ESP.getMaxAllocHeap(),
+      uxTaskGetStackHighWaterMark(renderTaskHandle)
+    );
+    Serial.println(buf);
+    reset_prof();
+  }
 }
+
