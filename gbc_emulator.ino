@@ -21,8 +21,12 @@ struct ProfileData {
   uint32_t sd_time_acc;
   uint32_t save_time_acc;
   uint32_t cache_misses;
+  uint32_t prefetch_requests;
   uint32_t prefetch_hits;
-  uint32_t prefetch_aborts;
+  uint32_t prefetch_sync_fallbacks;
+  uint32_t prefetch_cancellations;
+  uint32_t prefetch_wasted_bytes;
+  uint32_t prefetch_wait_time_acc;
   uint32_t loop_time_acc;
   uint32_t frames;
   uint32_t min_free_heap;
@@ -36,9 +40,14 @@ static void reset_prof() {
   prof.tft_time_acc = 0;
   prof.sd_time_acc = 0;
   prof.save_time_acc = 0;
+  prof.save_time_acc = 0;
   prof.cache_misses = 0;
+  prof.prefetch_requests = 0;
   prof.prefetch_hits = 0;
-  prof.prefetch_aborts = 0;
+  prof.prefetch_sync_fallbacks = 0;
+  prof.prefetch_cancellations = 0;
+  prof.prefetch_wasted_bytes = 0;
+  prof.prefetch_wait_time_acc = 0;
   prof.loop_time_acc = 0;
   prof.frames = 0;
   prof.min_free_heap = ESP.getFreeHeap();
@@ -136,11 +145,14 @@ static int      hot_bank_num  = -1;
 static int      hot_bank_slot = -1;
 static int      prev_bank_slot = -1;
 
+#include <atomic>
+
 // [PHASE 5] Predictive Prefetch State
-enum PrefetchState { PF_FREE = 0, PF_LOADING = 1, PF_READY = 2 };
-static volatile PrefetchState pf_state = PF_FREE;
-static volatile int pf_request_bank = -1;
-static volatile int pf_active_slot = -1;
+enum PrefetchState { PF_FREE = 0, PF_REQUESTED = 1, PF_LOADING = 2, PF_READY = 3 };
+static std::atomic<PrefetchState> pf_state(PF_FREE);
+static std::atomic<uint32_t> pf_request_gen(0);
+static std::atomic<int> pf_request_bank(-1);
+static std::atomic<int> pf_active_slot(-1);
 
 static File     rom_file;
 static uint32_t rom_total_size;
@@ -189,28 +201,36 @@ static uint8_t* cache_miss(int bank) {
   prof.cache_misses++;
 
   // [PHASE 5] Check if the bank we need was predictively prefetched
-  if (pf_request_bank == bank) {
-    if (pf_state == PF_READY && pf_active_slot > 0) {
+  PrefetchState state = pf_state.load(std::memory_order_acquire);
+  int req_bank = pf_request_bank.load(std::memory_order_relaxed);
+  
+  if (req_bank == bank) {
+    if (state == PF_READY) {
       prof.prefetch_hits++;
-      int slot = pf_active_slot;
+      int slot = pf_active_slot.load(std::memory_order_relaxed);
       bank_to_slot[bank] = slot;
-      pf_state = PF_FREE; // Slot is officially part of normal cache now
+      pf_state.store(PF_FREE, std::memory_order_release);
       
       prev_bank_slot = hot_bank_slot;
       hot_bank_ptr = bank_cache[slot].data;
       hot_bank_num = bank;
       hot_bank_slot = slot;
       return hot_bank_ptr;
-    } else if (pf_state == PF_LOADING) {
-      // Core 1 is currently loading it. Wait a tiny bit (synchronous fallback).
+    } else if (state == PF_REQUESTED || state == PF_LOADING) {
       uint32_t t0 = micros();
-      while (pf_state == PF_LOADING && (micros() - t0) < 3000) { taskYIELD(); }
+      while (true) {
+        state = pf_state.load(std::memory_order_acquire);
+        if (state == PF_READY || state == PF_FREE) break;
+        if ((micros() - t0) >= 2000) break;
+        taskYIELD();
+      }
+      prof.prefetch_wait_time_acc += (micros() - t0);
       
-      if (pf_state == PF_READY) {
+      if (state == PF_READY) {
         prof.prefetch_hits++;
-        int slot = pf_active_slot;
+        int slot = pf_active_slot.load(std::memory_order_relaxed);
         bank_to_slot[bank] = slot;
-        pf_state = PF_FREE;
+        pf_state.store(PF_FREE, std::memory_order_release);
         
         prev_bank_slot = hot_bank_slot;
         hot_bank_ptr = bank_cache[slot].data;
@@ -218,20 +238,30 @@ static uint8_t* cache_miss(int bank) {
         hot_bank_slot = slot;
         return hot_bank_ptr;
       } else {
-        prof.prefetch_aborts++;
+        // Timeout! Advance generation to invalidate the request
+        prof.prefetch_sync_fallbacks++;
+        pf_request_gen.fetch_add(1, std::memory_order_relaxed);
       }
     }
   }
 
   // [PHASE 3] Deterministic Cartridge-Aware Replacement
   // Exclude Bank 0 (Slot 0), Active Bank, Prev Bank, and any slot actively LOADING by Core 1.
-  int victim_slot = 1;
+  int victim_slot = -1;
   for (int i = 1; i < CACHE_SLOTS; i++) {
     if (i != hot_bank_slot && i != prev_bank_slot) {
-      if (pf_state == PF_LOADING && i == pf_active_slot) continue;
+      state = pf_state.load(std::memory_order_acquire);
+      int pf_slot = pf_active_slot.load(std::memory_order_relaxed);
+      if (state != PF_FREE && i == pf_slot) continue;
+      
       victim_slot = i;
       break;
     }
+  }
+  
+  if (victim_slot == -1) {
+    // If all other slots are pinned, active, or loading, evict the previous bank
+    victim_slot = prev_bank_slot;
   }
   
   cache_load_bank(victim_slot, bank);
@@ -359,26 +389,36 @@ static TaskHandle_t renderTaskHandle = NULL;
 
 // [PHASE 5] Callback from Walnut when MBC bank changes
 void gb_rom_bank_changed_callback(struct gb_s* gb, uint16_t new_bank) {
-  if (new_bank == hot_bank_num) return;
   if (new_bank < MAX_BANKS && bank_to_slot[new_bank] >= 0) return; 
 
-  if (pf_state == PF_READY) {
-    if (pf_request_bank == new_bank) return;
-    pf_state = PF_FREE; // Discard stale completed prefetch
+  PrefetchState state = pf_state.load(std::memory_order_acquire);
+  if (state == PF_REQUESTED || state == PF_LOADING) {
+    return; // Do not issue another request while one is in flight
   }
 
-  if (pf_state == PF_FREE) {
-    int victim = 1;
-    for (int i = 1; i < CACHE_SLOTS; i++) {
-      if (i != hot_bank_slot && i != prev_bank_slot) { victim = i; break; }
-    }
+  if (state == PF_READY) {
+    if (pf_request_bank.load(std::memory_order_relaxed) == new_bank) return;
+    pf_state.store(PF_FREE, std::memory_order_release); // Discard stale completed prefetch
+  }
+
+  // Pick victim slot
+  int victim = -1;
+  for (int i = 1; i < CACHE_SLOTS; i++) {
+    if (i != hot_bank_slot && i != prev_bank_slot) { victim = i; break; }
+  }
+  
+  if (victim > 0) {
     // Safely invalidate victim metadata on Core 0
     int old = bank_cache[victim].bank_num;
     if (old >= 0 && old < MAX_BANKS) bank_to_slot[old] = -1;
     bank_cache[victim].bank_num = -1;
     
-    pf_request_bank = new_bank;
-    pf_active_slot = victim;
+    pf_request_bank.store(new_bank, std::memory_order_relaxed);
+    pf_active_slot.store(victim, std::memory_order_relaxed);
+    pf_request_gen.fetch_add(1, std::memory_order_relaxed);
+    pf_state.store(PF_REQUESTED, std::memory_order_release);
+    prof.prefetch_requests++;
+    
     if (renderTaskHandle) xTaskNotify(renderTaskHandle, 0x02, eSetBits);
   }
 }
@@ -400,12 +440,16 @@ void renderTask(void *pvParameters) {
     }
 
     if (flags & 0x02) {
-      if (pf_state == PF_FREE && pf_request_bank >= 0 && pf_active_slot > 0) {
-        pf_state = PF_LOADING;
-        int req = pf_request_bank;
-        int slot = pf_active_slot;
+      PrefetchState state = pf_state.load(std::memory_order_acquire);
+      if (state == PF_REQUESTED) {
+        // Capture locally
+        uint32_t my_gen = pf_request_gen.load(std::memory_order_relaxed);
+        int my_slot = pf_active_slot.load(std::memory_order_relaxed);
+        int my_bank = pf_request_bank.load(std::memory_order_relaxed);
         
-        uint32_t offset = (uint32_t)req * BANK_SIZE;
+        pf_state.store(PF_LOADING, std::memory_order_release);
+        
+        uint32_t offset = (uint32_t)my_bank * BANK_SIZE;
         size_t to_read = BANK_SIZE;
         if (offset + to_read > rom_total_size) {
           to_read = rom_total_size - offset;
@@ -413,14 +457,18 @@ void renderTask(void *pvParameters) {
         
         uint32_t t0 = micros();
         rom_file.seek(offset);
-        rom_file.read(bank_cache[slot].data, to_read);
+        rom_file.read(bank_cache[my_slot].data, to_read);
         prof.sd_time_acc += (micros() - t0);
         
-        if (pf_request_bank == req) {
-          bank_cache[slot].bank_num = req;
-          pf_state = PF_READY;
+        uint32_t current_gen = pf_request_gen.load(std::memory_order_acquire);
+        if (current_gen == my_gen) {
+          bank_cache[my_slot].bank_num = my_bank;
+          pf_state.store(PF_READY, std::memory_order_release);
         } else {
-          pf_state = PF_FREE; // Cancelled mid-flight
+          // Cancelled mid-flight or stale
+          pf_state.store(PF_FREE, std::memory_order_release);
+          prof.prefetch_wasted_bytes += to_read;
+          prof.prefetch_cancellations++;
         }
       }
     }
@@ -690,8 +738,12 @@ void loop() {
       "TFT Push: %u ms/f\n"
       "SD Misses: %u\n"
       "SD Time: %u ms/miss\n"
+      "PF Reqs: %u\n"
       "PF Hits: %u\n"
-      "PF Aborts: %u\n"
+      "PF Cancels: %u\n"
+      "PF Fallbacks: %u\n"
+      "PF Wait: %u ms/f\n"
+      "PF Wasted: %u KB\n"
       "Save Time: %u ms\n"
       "Loop Total: %u ms/f (%.1f FPS)\n"
       "Min Free: %u\n"
@@ -704,8 +756,12 @@ void loop() {
       prof.tft_time_acc / 300000,
       prof.cache_misses,
       prof.cache_misses ? (prof.sd_time_acc / 1000) / prof.cache_misses : 0,
+      prof.prefetch_requests,
       prof.prefetch_hits,
-      prof.prefetch_aborts,
+      prof.prefetch_cancellations,
+      prof.prefetch_sync_fallbacks,
+      prof.prefetch_wait_time_acc / 300000,
+      prof.prefetch_wasted_bytes / 1024,
       (prof.save_time_acc / 1000),
       prof.loop_time_acc / 300000,
       300000000.0f / prof.loop_time_acc,
