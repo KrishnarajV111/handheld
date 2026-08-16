@@ -691,6 +691,10 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   btStop();
 
+  // ── CRITICAL: Verify core assignment ───────────────────────
+  Serial.printf("setup() running on Core %d\n", xPortGetCoreID());
+  Serial.printf("CONFIG_ARDUINO_RUNNING_CORE = %d\n", CONFIG_ARDUINO_RUNNING_CORE);
+
   // ── Allocate big chunks first ──────────────────────────────
   gb = (struct gb_s*)malloc(sizeof(struct gb_s));
   if (!gb) { Serial.println("OOM: gb_s"); while (1); }
@@ -789,110 +793,128 @@ void setup() {
   tft.fillScreen(ILI9341_BLACK);
   Serial.printf("Game start. Free: %u  Largest: %u\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  reset_prof();
+
+  // Launch emulation task EXPLICITLY on Core 0
+  // Arduino's loop() runs on Core 1 by default on most ESP32
+  // board packages. We CANNOT trust it for our dual-core design.
+  xTaskCreatePinnedToCore(emuTask, "Emulator", 8192, NULL, 1,
+                          NULL, 0);
+  Serial.printf("All tasks launched. Render=Core1 SD=Core1 Emu=Core0\n");
 }
 
 // ═══════════════════════════════════════════════════════════════
-// MAIN LOOP — Core 0
+// EMULATION TASK — Explicitly pinned to Core 0
 // ═══════════════════════════════════════════════════════════════
-// Core 0: emulation + cache/request logic
-// Core 1: TFT + all runtime SD access
-// These run on PHYSICALLY SEPARATE SPI buses. A cache miss on
-// Core 0 NEVER stalls the TFT, and the TFT NEVER stalls SD.
+// We do NOT use Arduino's loop() because it runs on Core 1 by
+// default (CONFIG_ARDUINO_RUNNING_CORE=1 in most board packages).
+// That would put the emulator, TFT task, and SD task all on
+// the same core, destroying our dual-core architecture.
+void emuTask(void *pvParameters) {
+  Serial.printf("emuTask running on Core %d\n", xPortGetCoreID());
+  reset_prof();
+
+  for (;;) {
+    uint32_t loop_start = micros();
+    frame_count++;
+
+    // Wait for Core 1 to finish previous TFT push before
+    // writing to the framebuffer.
+    uint32_t wait_start = micros();
+    while (render_buffer != NULL) { taskYIELD(); }
+    prof.core0_wait_acc += (micros() - wait_start);
+
+    // ── Joypad ─────────────────────────────────────────────────
+    gb->direct.joypad = 0xFF;
+    if (digitalRead(BTN_UP)==LOW)     gb->direct.joypad_bits.up     = 0;
+    if (digitalRead(BTN_DOWN)==LOW)   gb->direct.joypad_bits.down   = 0;
+    if (digitalRead(BTN_LEFT)==LOW)   gb->direct.joypad_bits.left   = 0;
+    if (digitalRead(BTN_RIGHT)==LOW)  gb->direct.joypad_bits.right  = 0;
+    if (digitalRead(BTN_A)==LOW)      gb->direct.joypad_bits.a      = 0;
+    if (digitalRead(BTN_B)==LOW)      gb->direct.joypad_bits.b      = 0;
+    if (digitalRead(BTN_START)==LOW)  gb->direct.joypad_bits.start  = 0;
+    if (digitalRead(BTN_SELECT)==LOW) gb->direct.joypad_bits.select = 0;
+
+    // ── Emulate one frame ──────────────────────────────────────
+    uint32_t emu_start = micros();
+    frame_drawn = false;
+    gb_run_frame_dualfetch(gb);
+    prof.emu_time_acc += (micros() - emu_start);
+
+    // ── Hand off to Core 1 for TFT push ───────────────────────
+    if (frame_drawn) {
+      render_buffer = framebuffer;
+      xTaskNotifyGive(renderTaskHandle);
+    }
+
+    // ── Auto-save (Core 0 requests, Core 1 executes) ──────────
+    if (frame_count % SAVE_INTERVAL_FRAMES == 0 && cart_ram_dirty) {
+      save_cart_ram();
+    }
+
+    prof.loop_time_acc += (micros() - loop_start);
+    prof.frames++;
+    
+    uint32_t fh = ESP.getFreeHeap();
+    if (fh < prof.min_free_heap) prof.min_free_heap = fh;
+
+    if (prof.frames >= 300) {
+      char buf[512];
+      snprintf(buf, sizeof(buf),
+        "\n=== PROFILING (300 frames) ===\n"
+        "Emu Core: %d\n"
+        "Emulation: %u ms/f\n"
+        "PPU (draw): %u ms/f\n"
+        "Core0 Wait: %u ms/f\n"
+        "TFT Push: %u ms/f\n"
+        "SD Misses: %u\n"
+        "SD Time: %u ms/miss\n"
+        "Dem Reqs: %u\n"
+        "Dem Wait: %u ms/f\n"
+        "PF Reqs: %u\n"
+        "PF Hits: %u\n"
+        "PF Cancels: %u\n"
+        "PF Fallbacks: %u\n"
+        "PF Wait: %u ms/f\n"
+        "PF Wasted: %u KB\n"
+        "Save Time: %u ms\n"
+        "Loop Total: %u ms/f (%.1f FPS)\n"
+        "Min Free: %u\n"
+        "Max Block: %u\n"
+        "C1 Render Stack: %u\n"
+        "C1 SD Stack: %u\n"
+        "==============================",
+        xPortGetCoreID(),
+        prof.emu_time_acc / 300000,
+        prof.ppu_time_acc / 300000,
+        prof.core0_wait_acc / 300000,
+        prof.tft_time_acc / 300000,
+        prof.cache_misses,
+        prof.cache_misses ? (prof.sd_time_acc / 1000) / prof.cache_misses : 0,
+        prof.demand_requests,
+        prof.demand_wait_time_acc / 300000,
+        prof.prefetch_requests,
+        prof.prefetch_hits,
+        prof.prefetch_cancellations,
+        prof.prefetch_sync_fallbacks,
+        prof.prefetch_wait_time_acc / 300000,
+        prof.prefetch_wasted_bytes / 1024,
+        (prof.save_time_acc / 1000),
+        prof.loop_time_acc / 300000,
+        300000000.0f / prof.loop_time_acc,
+        prof.min_free_heap,
+        ESP.getMaxAllocHeap(),
+        uxTaskGetStackHighWaterMark(renderTaskHandle),
+        uxTaskGetStackHighWaterMark(sdTaskHandle)
+      );
+      Serial.println(buf);
+      reset_prof();
+    }
+  }
+}
+
+// Arduino loop() is intentionally empty.
+// The emulation runs in emuTask pinned to Core 0.
 void loop() {
-  uint32_t loop_start = micros();
-  frame_count++;
-
-  // Wait for Core 1 to finish previous TFT push before
-  // writing to the framebuffer. If emulation (~15ms) is
-  // slower than TFT push (~9ms), this wait is ZERO.
-  uint32_t wait_start = micros();
-  while (render_buffer != NULL) { taskYIELD(); }
-  prof.core0_wait_acc += (micros() - wait_start);
-
-  // ── Joypad ─────────────────────────────────────────────────
-  gb->direct.joypad = 0xFF;
-  if (digitalRead(BTN_UP)==LOW)     gb->direct.joypad_bits.up     = 0;
-  if (digitalRead(BTN_DOWN)==LOW)   gb->direct.joypad_bits.down   = 0;
-  if (digitalRead(BTN_LEFT)==LOW)   gb->direct.joypad_bits.left   = 0;
-  if (digitalRead(BTN_RIGHT)==LOW)  gb->direct.joypad_bits.right  = 0;
-  if (digitalRead(BTN_A)==LOW)      gb->direct.joypad_bits.a      = 0;
-  if (digitalRead(BTN_B)==LOW)      gb->direct.joypad_bits.b      = 0;
-  if (digitalRead(BTN_START)==LOW)  gb->direct.joypad_bits.start  = 0;
-  if (digitalRead(BTN_SELECT)==LOW) gb->direct.joypad_bits.select = 0;
-
-  // ── Emulate one frame ──────────────────────────────────────
-  uint32_t emu_start = micros();
-  frame_drawn = false;
-  gb_run_frame_dualfetch(gb);
-  prof.emu_time_acc += (micros() - emu_start);
-
-  // ── Hand off to Core 1 for TFT push ───────────────────────
-  if (frame_drawn) {
-    render_buffer = framebuffer;
-    xTaskNotifyGive(renderTaskHandle);
-  }
-
-  // ── Auto-save (Core 0 requests, Core 1 executes) ────────────
-  if (frame_count % SAVE_INTERVAL_FRAMES == 0 && cart_ram_dirty) {
-    save_cart_ram();
-  }
-
-  prof.loop_time_acc += (micros() - loop_start);
-  prof.frames++;
-  
-  uint32_t fh = ESP.getFreeHeap();
-  if (fh < prof.min_free_heap) prof.min_free_heap = fh;
-
-  if (prof.frames >= 300) {
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-      "\n=== PROFILING (300 frames) ===\n"
-      "Emulation: %u ms/f\n"
-      "PPU (draw): %u ms/f\n"
-      "Core0 Wait: %u ms/f\n"
-      "TFT Push: %u ms/f\n"
-      "SD Misses: %u\n"
-      "SD Time: %u ms/miss\n"
-      "Dem Reqs: %u\n"
-      "Dem Wait: %u ms/f\n"
-      "PF Reqs: %u\n"
-      "PF Hits: %u\n"
-      "PF Cancels: %u\n"
-      "PF Fallbacks: %u\n"
-      "PF Wait: %u ms/f\n"
-      "PF Wasted: %u KB\n"
-      "Save Time: %u ms\n"
-      "Loop Total: %u ms/f (%.1f FPS)\n"
-      "Min Free: %u\n"
-      "Max Block: %u\n"
-      "C1 Render Stack: %u\n"
-      "C1 SD Stack: %u\n"
-      "==============================",
-      prof.emu_time_acc / 300000,
-      prof.ppu_time_acc / 300000,
-      prof.core0_wait_acc / 300000,
-      prof.tft_time_acc / 300000,
-      prof.cache_misses,
-      prof.cache_misses ? (prof.sd_time_acc / 1000) / prof.cache_misses : 0,
-      prof.demand_requests,
-      prof.demand_wait_time_acc / 300000,
-      prof.prefetch_requests,
-      prof.prefetch_hits,
-      prof.prefetch_cancellations,
-      prof.prefetch_sync_fallbacks,
-      prof.prefetch_wait_time_acc / 300000,
-      prof.prefetch_wasted_bytes / 1024,
-      (prof.save_time_acc / 1000),
-      prof.loop_time_acc / 300000,
-      300000000.0f / prof.loop_time_acc,
-      prof.min_free_heap,
-      ESP.getMaxAllocHeap(),
-      uxTaskGetStackHighWaterMark(renderTaskHandle),
-      uxTaskGetStackHighWaterMark(sdTaskHandle)
-    );
-    Serial.println(buf);
-    reset_prof();
-  }
+  vTaskDelay(portMAX_DELAY);
 }
 
