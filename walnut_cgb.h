@@ -732,6 +732,9 @@ struct gb_s
 	/* Read byte from boot ROM at given address. */
 	uint8_t (*gb_bootrom_read)(struct gb_s*, const uint_fast16_t addr);
 
+	/* Notification when MBC changes selected ROM bank */
+	void (*gb_rom_bank_changed)(struct gb_s*, uint16_t new_bank);
+
 	struct
 	{
 		bool gb_halt	: 1;
@@ -1249,12 +1252,8 @@ uint32_t __gb_read32(struct gb_s *gb, uint16_t addr)
         case 0xB:
             if (gb->mbc == 3 && gb->cart_ram_bank >= 0x08)
             {
-                const uint8_t *p =
-                    &gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08];
-                return (uint32_t)p[0]
-                     | ((uint32_t)p[1] << 8)
-                     | ((uint32_t)p[2] << 16)
-                     | ((uint32_t)p[3] << 24);
+                uint8_t v = (gb->cart_ram_bank <= 0x0C) ? gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08] : 0xFF;
+                return (uint32_t)v | ((uint32_t)v << 8) | ((uint32_t)v << 16) | ((uint32_t)v << 24);
             }
             else if (gb->cart_ram && gb->enable_cart_ram)
             {
@@ -1412,11 +1411,8 @@ uint32_t __gb_read32(struct gb_s *gb, uint16_t addr)
         case 0xB:
             if (gb->mbc == 3 && gb->cart_ram_bank >= 0x08)
             {
-                // RTC bytes; manual combination
-                return (uint32_t)gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08]
-                     | ((uint32_t)gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08 + 1] << 8)
-                     | ((uint32_t)gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08 + 2] << 16)
-                     | ((uint32_t)gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08 + 3] << 24);
+                uint8_t v = (gb->cart_ram_bank <= 0x0C) ? gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08] : 0xFF;
+                return (uint16_t)v | ((uint16_t)v << 8);
             }
             else if (gb->cart_ram && gb->enable_cart_ram)
             {
@@ -1547,7 +1543,9 @@ uint8_t __gb_read(struct gb_s *gb, uint16_t addr)
 	case 0xB:
 		if(gb->mbc == 3 && gb->cart_ram_bank >= 0x08)
 		{
-			return gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08];
+			if(gb->cart_ram_bank <= 0x0C)
+				return gb->rtc_latched.bytes[gb->cart_ram_bank - 0x08];
+			return 0xFF;
 		}
 		else if(gb->cart_ram && gb->enable_cart_ram)
 		{
@@ -1700,6 +1698,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 #if WALNUT_GB_SAFE_DUALFETCH_MBC
 			gb->prefetch_invalid=true;
 #endif
+			if (gb->gb_rom_bank_changed) gb->gb_rom_bank_changed(gb, gb->selected_rom_bank);
 			return;
 		}
 
@@ -1749,6 +1748,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 #if WALNUT_GB_SAFE_DUALFETCH_MBC
 		gb->prefetch_invalid=true;
 #endif
+		if (gb->gb_rom_bank_changed) gb->gb_rom_bank_changed(gb, gb->selected_rom_bank);
 		return;
 
 	case 0x4:
@@ -1758,6 +1758,7 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 			gb->cart_ram_bank = (val & 3);
 			gb->selected_rom_bank = ((val & 3) << 5) | (gb->selected_rom_bank & 0x1F);
 			gb->selected_rom_bank = gb->selected_rom_bank & gb->num_rom_banks_mask;
+			if (gb->gb_rom_bank_changed) gb->gb_rom_bank_changed(gb, gb->selected_rom_bank);
 		}
 		else if(gb->mbc == 3)
 		{
@@ -1802,13 +1803,17 @@ void __gb_write(struct gb_s *gb, uint_fast16_t addr, uint8_t val)
 	case 0xB:
 		if(gb->mbc == 3 && gb->cart_ram_bank >= 0x08)
 		{
-			const uint8_t rtc_reg_mask[5] = {
-				0x3F, 0x3F, 0x1F, 0xFF, 0xC1
-			};
-			uint8_t reg = gb->cart_ram_bank - 0x08;
-			//if(reg == 0) gb->counter.rtc_count = 0;
-
-			gb->rtc_real.bytes[reg] = val & rtc_reg_mask[reg];
+			if(gb->cart_ram_bank <= 0x0C)
+			{
+				const uint8_t rtc_reg_mask[5] = {
+					0x3F, 0x3F, 0x1F, 0xFF, 0xC1
+				};
+				uint8_t reg = gb->cart_ram_bank - 0x08;
+				uint8_t masked = val & rtc_reg_mask[reg];
+				gb->rtc_real.bytes[reg] = masked;
+				gb->rtc_latched.bytes[reg] = masked;
+			}
+			return;
 		}
 		/* Do not write to RAM if unavailable or disabled. */
 		else if(gb->cart_ram && gb->enable_cart_ram)
@@ -7766,14 +7771,35 @@ void gb_set_bootrom(struct gb_s *gb,
 	gb->gb_bootrom_read = gb_bootrom_read;
 }
 
-/**
- * Deprecated. Will be removed in the next major version.
- */
-WGB_DEPRECATED("RTC is now ticked internally; this function has no effect")
 void gb_tick_rtc(struct gb_s *gb)
 {
-	(void) gb;
-	return;
+	if (!gb) return;
+	if ((gb->rtc_real.reg.high & 0x40) == 0)
+	{
+		gb->rtc_real.reg.sec++;
+		if (gb->rtc_real.reg.sec >= 60)
+		{
+			gb->rtc_real.reg.sec = 0;
+			gb->rtc_real.reg.min++;
+			if (gb->rtc_real.reg.min >= 60)
+			{
+				gb->rtc_real.reg.min = 0;
+				gb->rtc_real.reg.hour++;
+				if (gb->rtc_real.reg.hour >= 24)
+				{
+					gb->rtc_real.reg.hour = 0;
+					uint16_t days = ((gb->rtc_real.reg.high & 1) << 8) | gb->rtc_real.reg.yday;
+					days++;
+					gb->rtc_real.reg.yday = days & 0xFF;
+					if (days > 511)
+					{
+						gb->rtc_real.reg.high |= 0x80;
+					}
+					gb->rtc_real.reg.high = (gb->rtc_real.reg.high & ~1) | ((days >> 8) & 1);
+				}
+			}
+		}
+	}
 }
 
 void gb_set_rtc(struct gb_s *gb, const struct tm * const time)
